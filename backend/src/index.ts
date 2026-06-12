@@ -9,8 +9,8 @@ import gatheringRoutes from './routes/gathering';
 import skillsRoutes from './routes/skills';
 import processingRoutes from './routes/processing';
 import warehouseRoutes from './routes/warehouse';
-import { query } from './config/database';
 import { checkAndCompleteGathering, initializeGatheringConfig } from './services/gatheringService';
+import { listDueActiveIdleTaskUsers } from './services/idleTaskService';
 
 dotenv.config();
 
@@ -18,7 +18,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+}));
 app.use(express.json());
 
 // Routes
@@ -73,15 +75,13 @@ async function startGatheringChecker(): Promise<void> {
   // 每10秒检查一次
   setInterval(async () => {
     try {
-      // 获取所有有活跃采集任务的玩家
-      const players = await query<{ user_id: string; idle_queue: any[] }>(
-        "SELECT user_id, idle_queue FROM players WHERE idle_queue::text LIKE '%\"status\": \"active\"%'"
-      );
+      // 获取所有已到期的活跃采集任务玩家
+      const players = await listDueActiveIdleTaskUsers();
 
       for (const player of players) {
-        const task = await checkAndCompleteGathering(player.user_id);
+        const task = await checkAndCompleteGathering(player.userId);
         if (task) {
-          console.log(`[Gathering] Task completed for user ${player.user_id}:`, task.result);
+          console.log(`[Gathering] Task completed for user ${player.userId}:`, task.result);
         }
       }
     } catch (error) {

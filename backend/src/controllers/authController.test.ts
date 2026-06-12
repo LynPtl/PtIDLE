@@ -3,6 +3,55 @@ import request from 'supertest';
 import express from 'express';
 import authRoutes from '../routes/auth';
 
+const registeredUsers = new Set<string>();
+
+jest.mock('../services/authService', () => {
+  const actual = jest.requireActual('../services/authService');
+  return {
+    ...actual,
+    createUser: jest.fn(async ({ username, password }: { username: string; password: string }) => {
+      if (!username || username.trim().length === 0) {
+        throw new actual.InvalidInputError('Username is required');
+      }
+      if (!password || password.length < 6) {
+        throw new actual.InvalidInputError('Password must be at least 6 characters');
+      }
+      const trimmed = username.trim();
+      if (registeredUsers.has(trimmed)) {
+        throw new actual.UserAlreadyExistsError(trimmed);
+      }
+      registeredUsers.add(trimmed);
+      return {
+        id: `user-${trimmed}`,
+        username: trimmed,
+        created_at: new Date('2026-06-12T00:00:00.000Z'),
+        last_login: null,
+      };
+    }),
+    login: jest.fn(async (username: string, password: string) => {
+      if (!username || username.trim().length === 0) {
+        throw new actual.InvalidInputError('Username is required');
+      }
+      if (!password || password.length === 0) {
+        throw new actual.InvalidInputError('Password is required');
+      }
+      if (username.includes('nonexistent') || password === 'wrongpassword') {
+        throw new actual.InvalidCredentialsError();
+      }
+      const trimmed = username.trim();
+      return {
+        token: 'mock_token',
+        user: {
+          id: `user-${trimmed}`,
+          username: trimmed,
+          created_at: new Date('2026-06-12T00:00:00.000Z'),
+          last_login: new Date('2026-06-12T00:00:00.000Z'),
+        },
+      };
+    }),
+  };
+});
+
 // Create test app
 const app = express();
 app.use(express.json());
@@ -11,6 +60,10 @@ app.use('/api/auth', authRoutes);
 describe('Auth API Integration Tests', () => {
   const testUsername = `testuser_${Date.now()}`;
   const testPassword = 'password123';
+
+  beforeEach(() => {
+    registeredUsers.clear();
+  });
 
   describe('POST /api/auth/register', () => {
     it('should register a new user successfully', async () => {

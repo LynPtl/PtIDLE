@@ -1,4 +1,5 @@
 import { query } from '../config/database';
+import { getInventorySummary } from './inventoryService';
 
 export interface WarehouseData {
   resources: Record<string, number>;
@@ -14,12 +15,10 @@ export interface WarehouseData {
  */
 export async function getWarehouseData(userId: string): Promise<WarehouseData | null> {
   const result = await query<{
-    resources: Record<string, number>;
-    materials: Record<string, number>;
-    production_gear: Record<string, any>;
+    id: string;
     warehouse_limits: Record<string, number>;
   }>(
-    'SELECT resources, materials, production_gear, warehouse_limits FROM players WHERE user_id = $1',
+    'SELECT id, warehouse_limits FROM players WHERE user_id = $1',
     [userId]
   );
 
@@ -28,11 +27,12 @@ export async function getWarehouseData(userId: string): Promise<WarehouseData | 
   }
 
   const player = result[0];
+  const inventory = await getInventorySummary(player.id);
 
   return {
-    resources: player.resources || {},
-    materials: player.materials || {},
-    production_gear: player.production_gear || {},
+    resources: inventory.resource,
+    materials: inventory.material,
+    production_gear: inventory.gear,
     storageLimits: player.warehouse_limits || {},
   };
 }

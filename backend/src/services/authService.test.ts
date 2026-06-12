@@ -1,13 +1,19 @@
 // Unit tests for authService
 import * as authService from '../services/authService';
-import { query, execute } from '../config/database';
+import { query, execute, withTransaction } from '../config/database';
+import { initializePlayer } from './playerService';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
 // Mock the database module
 jest.mock('../config/database', () => ({
   query: jest.fn(),
-  execute: jest.fn()
+  execute: jest.fn(),
+  withTransaction: jest.fn(),
+}));
+
+jest.mock('./playerService', () => ({
+  initializePlayer: jest.fn(),
 }));
 
 // Mock bcryptjs
@@ -34,10 +40,19 @@ afterAll(() => {
 
 const mockedQuery = query as jest.MockedFunction<typeof query>;
 const mockedExecute = execute as jest.MockedFunction<typeof execute>;
+const mockedWithTransaction = withTransaction as jest.MockedFunction<typeof withTransaction>;
+const mockedInitializePlayer = initializePlayer as jest.MockedFunction<typeof initializePlayer>;
+
+const mockTransactionClient = {
+  query: jest.fn(),
+};
 
 describe('authService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockedWithTransaction.mockImplementation(async callback => callback(mockTransactionClient as any));
+    mockedInitializePlayer.mockResolvedValue(undefined);
+    mockTransactionClient.query.mockResolvedValue({ rows: [], rowCount: 1 });
   });
 
   describe('createUser', () => {
@@ -55,7 +70,13 @@ describe('authService', () => {
 
       expect(result.username).toBe(validInput.username);
       expect(result.id).toBeDefined();
-      expect(mockedExecute).toHaveBeenCalled();
+      expect(mockedWithTransaction).toHaveBeenCalledTimes(1);
+      expect(mockTransactionClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO users'),
+        expect.any(Array)
+      );
+      expect(mockedInitializePlayer).toHaveBeenCalledWith(result.id, mockTransactionClient);
+      expect(mockedExecute).not.toHaveBeenCalled();
     });
 
     it('should throw InvalidInputError when username is empty', async () => {
@@ -90,8 +111,25 @@ describe('authService', () => {
 
       await authService.createUser({ username: '  testuser  ', password: 'password123' });
 
-      const executeCall = mockedExecute.mock.calls[0];
-      expect(executeCall?.[1]?.[1]).toBe('testuser');
+      const insertCall = mockTransactionClient.query.mock.calls.find(call =>
+        String(call[0]).includes('INSERT INTO users')
+      );
+      expect(insertCall?.[1]?.[1]).toBe('testuser');
+    });
+
+    it('should not create an orphan user when player initialization fails', async () => {
+      mockedQuery.mockResolvedValue([]);
+      mockedInitializePlayer.mockRejectedValue(new Error('player init failed'));
+
+      await expect(authService.createUser(validInput)).rejects.toThrow('player init failed');
+
+      expect(mockedWithTransaction).toHaveBeenCalledTimes(1);
+      expect(mockTransactionClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO users'),
+        expect.any(Array)
+      );
+      expect(mockedInitializePlayer).toHaveBeenCalledWith(expect.any(String), mockTransactionClient);
+      expect(mockedExecute).not.toHaveBeenCalled();
     });
   });
 

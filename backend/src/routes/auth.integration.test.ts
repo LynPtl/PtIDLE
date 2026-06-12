@@ -2,7 +2,7 @@
 import request from 'supertest';
 import express from 'express';
 import authRoutes from '../routes/auth';
-import { query, execute } from '../config/database';
+import { query, execute, withTransaction } from '../config/database';
 
 // Create test app
 const app = express();
@@ -12,7 +12,8 @@ app.use('/api/auth', authRoutes);
 // Mock the database module
 jest.mock('../config/database', () => ({
   query: jest.fn(),
-  execute: jest.fn()
+  execute: jest.fn(),
+  withTransaction: jest.fn(),
 }));
 
 // Mock bcryptjs
@@ -28,12 +29,22 @@ jest.mock('jsonwebtoken', () => ({
 
 const mockedQuery = query as jest.MockedFunction<typeof query>;
 const mockedExecute = execute as jest.MockedFunction<typeof execute>;
+const mockedWithTransaction = withTransaction as jest.MockedFunction<typeof withTransaction>;
+const mockTransactionClient = { query: jest.fn() };
 
 describe('Auth API Integration Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockedQuery.mockReset();
     mockedExecute.mockReset();
+    mockTransactionClient.query.mockReset();
+    mockedWithTransaction.mockImplementation(async callback => callback(mockTransactionClient as any));
+    mockTransactionClient.query.mockImplementation(async (sql: string, params?: any[]) => {
+      if (sql.includes('SELECT id') && sql.includes('FROM inventory_items')) {
+        return { rows: [{ id: `inventory-${params?.[2]}` }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    });
     process.env.JWT_SECRET = 'test_secret';
     process.env.JWT_EXPIRES_IN = '7d';
   });
@@ -45,12 +56,7 @@ describe('Auth API Integration Tests', () => {
     };
 
     it('should register a new user and create player data', async () => {
-      // Mock: no existing user, then successful insert
-      mockedQuery
-        .mockResolvedValueOnce([]) // Check existing user
-        .mockResolvedValueOnce([{ id: 'player-uuid' }]); // getPlayerIdByUserId
-
-      mockedExecute.mockResolvedValue(1);
+      mockedQuery.mockResolvedValueOnce([]);
 
       const response = await request(app)
         .post('/api/auth/register')
@@ -61,8 +67,16 @@ describe('Auth API Integration Tests', () => {
       expect(response.body.data).toBeDefined();
       expect(response.body.data.username).toBe(validRegisterInput.username);
 
-      // Verify player was created (execute called 4 times: 1 user + 1 player + 3 characters)
-      expect(mockedExecute).toHaveBeenCalledTimes(5);
+      expect(mockedWithTransaction).toHaveBeenCalledTimes(1);
+      expect(mockTransactionClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO users'),
+        expect.any(Array)
+      );
+      expect(mockTransactionClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO players'),
+        expect.any(Array)
+      );
+      expect(mockTransactionClient.query.mock.calls.filter(call => String(call[0]).includes('INSERT INTO characters'))).toHaveLength(3);
     });
 
     it('should return 400 for missing username', async () => {
@@ -113,10 +127,7 @@ describe('Auth API Integration Tests', () => {
     });
 
     it('should trim whitespace from username', async () => {
-      mockedQuery
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([{ id: 'player-uuid' }]);
-      mockedExecute.mockResolvedValue(1);
+      mockedQuery.mockResolvedValueOnce([]);
 
       await request(app)
         .post('/api/auth/register')

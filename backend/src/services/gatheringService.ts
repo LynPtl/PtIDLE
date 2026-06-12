@@ -1,5 +1,14 @@
-import { query, execute } from '../config/database';
-import { getGatheringConfig, getGatheringSkillByType, clearSkillsCache } from './skillService';
+import { DbClient, query, withTransaction } from '../config/database';
+import { getGatheringConfig } from './skillService';
+import { addInventoryItem } from './inventoryService';
+import {
+  cancelActiveIdleTask,
+  completeIdleTask,
+  createIdleTask,
+  getActiveIdleTaskByPlayerId,
+  getActiveIdleTaskByUserId,
+  IdleTask,
+} from './idleTaskService';
 
 export type SkillType = 'mining' | 'woodcutting' | 'herbalism';
 
@@ -52,6 +61,24 @@ async function getConfig(): Promise<Record<SkillType, {
 // 默认采集时长（秒）
 const DEFAULT_GATHERING_DURATION = 60; // 1 minute for testing
 
+async function clientQuery<T = any>(client: DbClient, text: string, params?: any[]): Promise<T[]> {
+  const result = await client.query(text, params);
+  return result.rows;
+}
+
+function toGatheringTask(task: IdleTask): GatheringTask {
+  const duration = Math.floor((task.endsAt.getTime() - task.startedAt.getTime()) / 1000);
+  return {
+    id: task.id,
+    skillType: task.skillType,
+    characterId: task.characterId,
+    startedAt: task.startedAt.toISOString(),
+    duration,
+    status: task.status === 'claimed' ? 'completed' : task.status,
+    result: task.result as GatheringTask['result'],
+  };
+}
+
 /**
  * 开始采集任务
  * @param userId 用户ID
@@ -63,50 +90,34 @@ export async function startGathering(
   skillType: SkillType,
   characterId?: string
 ): Promise<GatheringTask | null> {
-  // 1. 获取玩家当前状态
-  const playerResult = await query<{
-    id: string;
-    resources: Record<string, number>;
-    warehouse_limits: Record<string, number>;
-    idle_queue: GatheringTask[];
-  }>(
-    'SELECT id, resources, warehouse_limits, idle_queue FROM players WHERE user_id = $1',
-    [userId]
-  );
+  return withTransaction(async client => {
+    const playerResult = await clientQuery<{ id: string }>(
+      client,
+      'SELECT id FROM players WHERE user_id = $1',
+      [userId]
+    );
 
-  if (playerResult.length === 0) {
-    return null;
-  }
+    if (playerResult.length === 0) {
+      return null;
+    }
 
-  const player = playerResult[0];
-  const idleQueue: GatheringTask[] = player.idle_queue || [];
+    const playerId = playerResult[0].id;
+    const activeTask = await getActiveIdleTaskByPlayerId(playerId, client);
+    if (activeTask) {
+      throw new Error('已有进行中的采集任务');
+    }
 
-  // 2. 检查是否已有进行中的采集任务
-  const activeTask = idleQueue.find(task => task.status === 'active');
-  if (activeTask) {
-    throw new Error('已有进行中的采集任务');
-  }
+    const task = await createIdleTask(
+      playerId,
+      skillType,
+      characterId,
+      DEFAULT_GATHERING_DURATION,
+      new Date(),
+      client
+    );
 
-  // 3. 创建新采集任务
-  const config = (await getConfig())[skillType];
-  const now = new Date();
-  const task: GatheringTask = {
-    id: `gathering_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-    skillType,
-    characterId,
-    startedAt: now.toISOString(),
-    duration: DEFAULT_GATHERING_DURATION,
-    status: 'active',
-  };
-
-  // 4. 更新 idle_queue
-  idleQueue.push(task);
-  await execute(
-    'UPDATE players SET idle_queue = $1, updated_at = NOW() WHERE user_id = $2',
-    [JSON.stringify(idleQueue), userId]
-  );
-
-  return task;
+    return toGatheringTask(task);
+  });
 }
 
 /**
@@ -116,21 +127,14 @@ export async function startGathering(
 export async function getGatheringStatus(
   userId: string
 ): Promise<GatheringTask | null> {
-  const playerResult = await query<{
-    idle_queue: GatheringTask[];
-  }>(
-    'SELECT idle_queue FROM players WHERE user_id = $1',
-    [userId]
-  );
-
-  if (playerResult.length === 0) {
+  const activeIdleTask = await getActiveIdleTaskByUserId(userId);
+  
+  // 返回最新的活跃任务
+  if (!activeIdleTask) {
     return null;
   }
 
-  const idleQueue: GatheringTask[] = playerResult[0].idle_queue || [];
-  // 返回最新的活跃任务
-  const activeTask = idleQueue.find(task => task.status === 'active');
-
+  const activeTask = toGatheringTask(activeIdleTask);
   if (!activeTask) {
     return null;
   }
@@ -190,90 +194,70 @@ async function calculateGatheringYield(
  * @param userId 用户ID
  */
 export async function completeGathering(userId: string): Promise<GatheringTask | null> {
-  // 1. 获取玩家数据
-  const playerResult = await query<{
-    id: string;
-    resources: Record<string, number>;
-    warehouse_limits: Record<string, number>;
-    idle_queue: GatheringTask[];
-    production_gear: Record<string, any>;
-  }>(
-    'SELECT id, resources, warehouse_limits, idle_queue, production_gear FROM players WHERE user_id = $1',
-    [userId]
-  );
+  return withTransaction(async client => {
+    const playerResult = await clientQuery<{
+      id: string;
+      warehouse_limits: Record<string, number> | null;
+    }>(
+      client,
+      'SELECT id, warehouse_limits FROM players WHERE user_id = $1',
+      [userId]
+    );
 
-  if (playerResult.length === 0) {
-    return null;
-  }
-
-  const player = playerResult[0];
-  const idleQueue: GatheringTask[] = player.idle_queue || [];
-
-  // 2. 查找活跃任务
-  const activeTaskIndex = idleQueue.findIndex(task => task.status === 'active');
-  if (activeTaskIndex === -1) {
-    return null;
-  }
-
-  const activeTask = idleQueue[activeTaskIndex];
-
-  // 3. 检查任务是否已到期
-  const startTime = new Date(activeTask.startedAt).getTime();
-  const now = Date.now();
-  const elapsedSeconds = (now - startTime) / 1000;
-
-  if (elapsedSeconds < activeTask.duration) {
-    // 任务尚未完成
-    return null;
-  }
-
-  // 4. 计算产出
-  const { resources: earned, overflowed } = await calculateGatheringYield(
-    activeTask,
-    player.production_gear || {}
-  );
-
-  // 5. 应用仓储上限
-  const currentResources = player.resources || {};
-  const limits = player.warehouse_limits || { resource: 1000 };
-
-  const stored: Record<string, number> = {};
-  const actualOverflowed: Record<string, number> = {};
-
-  for (const [resource, amount] of Object.entries(earned)) {
-    const current = currentResources[resource] || 0;
-    const limit = limits.resource;
-    const maxAdd = Math.max(0, limit - current);
-    const actualStored = Math.min(amount, maxAdd);
-
-    stored[resource] = actualStored;
-    if (amount > maxAdd) {
-      actualOverflowed[resource] = amount - maxAdd;
+    if (playerResult.length === 0) {
+      return null;
     }
-  }
 
-  // 6. 更新玩家资源
-  const updatedResources = { ...currentResources };
-  for (const [resource, amount] of Object.entries(stored)) {
-    updatedResources[resource] = (updatedResources[resource] || 0) + amount;
-  }
+    const player = playerResult[0];
+    const activeIdleTask = await getActiveIdleTaskByPlayerId(player.id, client);
+    if (!activeIdleTask) {
+      return null;
+    }
 
-  // 7. 更新任务状态为完成
-  idleQueue[activeTaskIndex] = {
-    ...activeTask,
-    status: 'completed',
-    result: {
-      resources: stored,
-      overflowed: actualOverflowed,
-    },
-  };
+    if (Date.now() < activeIdleTask.endsAt.getTime()) {
+      return null;
+    }
 
-  await execute(
-    'UPDATE players SET resources = $1, idle_queue = $2, updated_at = NOW() WHERE user_id = $3',
-    [JSON.stringify(updatedResources), JSON.stringify(idleQueue), userId]
-  );
+    const currentResourceRows = await clientQuery<{ item_key: string; quantity: number | string }>(
+      client,
+      `SELECT item_key, COALESCE(SUM(quantity), 0) AS quantity
+       FROM inventory_items
+       WHERE player_id = $1 AND item_type = 'resource'
+       GROUP BY item_key`,
+      [player.id]
+    );
+    const currentResources = currentResourceRows.reduce<Record<string, number>>((resources, row) => {
+      resources[row.item_key] = Number(row.quantity);
+      return resources;
+    }, {});
 
-  return idleQueue[activeTaskIndex];
+    const taskForYield = toGatheringTask(activeIdleTask);
+    const { resources: earned } = await calculateGatheringYield(taskForYield, {});
+    const limits = player.warehouse_limits || { resource: 1000 };
+    const stored: Record<string, number> = {};
+    const overflowed: Record<string, number> = {};
+
+    for (const [resource, amount] of Object.entries(earned)) {
+      const current = currentResources[resource] || 0;
+      const limit = limits.resource || 1000;
+      const maxAdd = Math.max(0, limit - current);
+      const actualStored = Math.min(amount, maxAdd);
+      stored[resource] = actualStored;
+      if (amount > actualStored) {
+        overflowed[resource] = amount - actualStored;
+      }
+      await addInventoryItem(player.id, 'resource', resource, actualStored, {}, client);
+    }
+
+    const result = { resources: stored, overflowed };
+    await completeIdleTask(activeIdleTask.id, result, client);
+
+    return {
+      ...taskForYield,
+      status: 'completed',
+      result,
+    };
+  });
 }
 
 /**
@@ -281,32 +265,24 @@ export async function completeGathering(userId: string): Promise<GatheringTask |
  * @param userId 用户ID
  */
 export async function cancelGathering(userId: string): Promise<boolean> {
-  const playerResult = await query<{
-    idle_queue: GatheringTask[];
-  }>(
-    'SELECT idle_queue FROM players WHERE user_id = $1',
-    [userId]
-  );
+  return withTransaction(async client => {
+    const playerResult = await clientQuery<{ id: string }>(
+      client,
+      'SELECT id FROM players WHERE user_id = $1',
+      [userId]
+    );
 
-  if (playerResult.length === 0) {
-    return false;
-  }
+    if (playerResult.length === 0) {
+      return false;
+    }
 
-  const idleQueue: GatheringTask[] = playerResult[0].idle_queue || [];
-  const activeTaskIndex = idleQueue.findIndex(task => task.status === 'active');
+    const activeTask = await getActiveIdleTaskByPlayerId(playerResult[0].id, client);
+    if (!activeTask) {
+      return false;
+    }
 
-  if (activeTaskIndex === -1) {
-    return false;
-  }
-
-  idleQueue[activeTaskIndex].status = 'cancelled';
-
-  await execute(
-    'UPDATE players SET idle_queue = $1, updated_at = NOW() WHERE user_id = $2',
-    [JSON.stringify(idleQueue), userId]
-  );
-
-  return true;
+    return cancelActiveIdleTask(activeTask.id, client);
+  });
 }
 
 /**
@@ -314,29 +290,12 @@ export async function cancelGathering(userId: string): Promise<boolean> {
  * @param userId 用户ID
  */
 export async function checkAndCompleteGathering(userId: string): Promise<GatheringTask | null> {
-  const playerResult = await query<{
-    idle_queue: GatheringTask[];
-  }>(
-    'SELECT idle_queue FROM players WHERE user_id = $1',
-    [userId]
-  );
-
-  if (playerResult.length === 0) {
-    return null;
-  }
-
-  const idleQueue: GatheringTask[] = playerResult[0].idle_queue || [];
-  const activeTask = idleQueue.find(task => task.status === 'active');
-
+  const activeTask = await getActiveIdleTaskByUserId(userId);
   if (!activeTask) {
     return null;
   }
 
-  const startTime = new Date(activeTask.startedAt).getTime();
-  const now = Date.now();
-  const elapsedSeconds = (now - startTime) / 1000;
-
-  if (elapsedSeconds >= activeTask.duration) {
+  if (Date.now() >= activeTask.endsAt.getTime()) {
     return completeGathering(userId);
   }
 

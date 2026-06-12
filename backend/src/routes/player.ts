@@ -2,13 +2,9 @@ import { Router } from 'express';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import {
   getPlayerProfile,
-  getPlayerBaseInfo,
-  updateResources,
-  updateLastOffline,
 } from '../services/playerService';
 import {
-  calculateOfflineEarnings,
-  applyWarehouseLimits,
+  claimOfflineIdleRewards,
 } from '../services/offlineService';
 
 const router = Router();
@@ -47,38 +43,22 @@ router.post('/offline-claim', authMiddleware, async (req: AuthRequest, res) => {
       return;
     }
 
-    // 1. 获取玩家基础信息
-    const baseInfo = await getPlayerBaseInfo(userId);
-    if (!baseInfo) {
+    // 离线收益只能由真实 idle_tasks 结算，不再按 last_offline 凭空发放资源
+    const claimResult = await claimOfflineIdleRewards(userId);
+    if (!claimResult) {
       res.status(404).json({ error: 'Player not found' });
       return;
     }
 
-    // 2. 计算离线收益
-    const earnings = calculateOfflineEarnings(baseInfo.last_offline);
-
-    // 3. 应用仓储上限
-    const { stored, overflowed } = applyWarehouseLimits(
-      earnings,
-      baseInfo.resources,
-      baseInfo.warehouse_limits
-    );
-
-    // 4. 更新玩家资源
-    await updateResources(userId, stored);
-
-    // 5. 更新离线时间
-    await updateLastOffline(userId);
-
-    // 6. 返回收益详情
     res.json({
       success: true,
       data: {
-        offlineTime: earnings.offlineTime,
-        earned: earnings.resources,
-        stored,
-        overflowed,
-        lastOffline: baseInfo.last_offline,
+        offlineTime: claimResult.offlineTime,
+        taskCount: claimResult.taskCount,
+        earned: claimResult.earned,
+        stored: claimResult.stored,
+        overflowed: claimResult.overflowed,
+        lastOffline: claimResult.lastOffline,
       },
     });
   } catch (error) {

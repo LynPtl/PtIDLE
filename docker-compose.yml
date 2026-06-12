@@ -1,15 +1,29 @@
-# 开发环境使用本地 PostgreSQL (端口 5433) 和本地 Redis (端口 6379)
-# 生产环境可使用 Docker 容器部署
-
 services:
-  # PostgreSQL (生产用)
-  # postgres:
-  #   image: postgres:16
-  #   ports:
-  #     - "5432:5432"
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ptidle
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ptidle"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # Redis (生产用)
-  # redis:
-  #   image: redis:7-alpine
-  #   ports:
-  #     - "6379:6379"
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

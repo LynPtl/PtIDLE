@@ -4,14 +4,14 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import playerRoutes from '../routes/player';
 import * as playerService from '../services/playerService';
+import * as offlineService from '../services/offlineService';
 
 // Mock the playerService
 jest.mock('../services/playerService');
+jest.mock('../services/offlineService');
 
 const mockedGetPlayerProfile = playerService.getPlayerProfile as jest.MockedFunction<typeof playerService.getPlayerProfile>;
-const mockedGetPlayerBaseInfo = playerService.getPlayerBaseInfo as jest.MockedFunction<typeof playerService.getPlayerBaseInfo>;
-const mockedUpdateResources = playerService.updateResources as jest.MockedFunction<typeof playerService.updateResources>;
-const mockedUpdateLastOffline = playerService.updateLastOffline as jest.MockedFunction<typeof playerService.updateLastOffline>;
+const mockedClaimOfflineIdleRewards = offlineService.claimOfflineIdleRewards as jest.MockedFunction<typeof offlineService.claimOfflineIdleRewards>;
 
 const app = express();
 app.use(express.json());
@@ -146,7 +146,7 @@ describe('Player API Integration Tests', () => {
     });
 
     it('should return 404 when player not found', async () => {
-      mockedGetPlayerBaseInfo.mockResolvedValue(null);
+      mockedClaimOfflineIdleRewards.mockResolvedValue(null);
 
       const response = await request(app)
         .post('/api/player/offline-claim')
@@ -159,15 +159,14 @@ describe('Player API Integration Tests', () => {
     it('should return offline earnings for valid request', async () => {
       const lastOffline = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago
 
-      mockedGetPlayerBaseInfo.mockResolvedValue({
-        resources: { iron_ore: 0, coal: 0, wood: 0, sap: 0, herb: 0, mushroom: 0 },
-        warehouse_limits: { resource: 1000, material: 500 },
-        last_offline: lastOffline,
+      mockedClaimOfflineIdleRewards.mockResolvedValue({
+        offlineTime: 60,
+        taskCount: 1,
+        earned: { iron_ore: 60 },
+        stored: { iron_ore: 60 },
+        overflowed: {},
+        lastOffline,
       });
-      mockedUpdateResources.mockResolvedValue({
-        iron_ore: 60, coal: 30, wood: 60, sap: 30, herb: 60, mushroom: 30,
-      });
-      mockedUpdateLastOffline.mockResolvedValue();
 
       const response = await request(app)
         .post('/api/player/offline-claim')
@@ -176,23 +175,24 @@ describe('Player API Integration Tests', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.data.offlineTime).toBe(60);
-      expect(response.body.data.earned.iron_ore).toBe(60);
+      expect(response.body.data.taskCount).toBe(1);
+      expect(response.body.data.earned).toEqual({ iron_ore: 60 });
       expect(response.body.data.stored.iron_ore).toBe(60);
-      expect(response.body.data.overflowed.iron_ore).toBe(0);
+      expect(response.body.data.overflowed).toEqual({});
+      expect(mockedClaimOfflineIdleRewards).toHaveBeenCalledWith(testUserId);
     });
 
     it('should apply warehouse limits correctly', async () => {
       const lastOffline = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago
 
-      mockedGetPlayerBaseInfo.mockResolvedValue({
-        resources: { iron_ore: 950, coal: 500, wood: 0, sap: 0, herb: 0, mushroom: 0 },
-        warehouse_limits: { resource: 1000, material: 500 },
-        last_offline: lastOffline,
+      mockedClaimOfflineIdleRewards.mockResolvedValue({
+        offlineTime: 60,
+        taskCount: 1,
+        earned: { iron_ore: 60 },
+        stored: { iron_ore: 50 },
+        overflowed: { iron_ore: 10 },
+        lastOffline,
       });
-      mockedUpdateResources.mockResolvedValue({
-        iron_ore: 100, coal: 500, wood: 60, sap: 30, herb: 60, mushroom: 30,
-      });
-      mockedUpdateLastOffline.mockResolvedValue();
 
       const response = await request(app)
         .post('/api/player/offline-claim')
@@ -204,15 +204,14 @@ describe('Player API Integration Tests', () => {
     });
 
     it('should handle zero offline time', async () => {
-      mockedGetPlayerBaseInfo.mockResolvedValue({
-        resources: { iron_ore: 0, coal: 0, wood: 0, sap: 0, herb: 0, mushroom: 0 },
-        warehouse_limits: { resource: 1000, material: 500 },
-        last_offline: new Date(), // Just now
+      mockedClaimOfflineIdleRewards.mockResolvedValue({
+        offlineTime: 0,
+        taskCount: 0,
+        earned: {},
+        stored: {},
+        overflowed: {},
+        lastOffline: new Date(),
       });
-      mockedUpdateResources.mockResolvedValue({
-        iron_ore: 0, coal: 0, wood: 0, sap: 0, herb: 0, mushroom: 0,
-      });
-      mockedUpdateLastOffline.mockResolvedValue();
 
       const response = await request(app)
         .post('/api/player/offline-claim')
@@ -220,7 +219,7 @@ describe('Player API Integration Tests', () => {
 
       expect(response.status).toBe(200);
       expect(response.body.data.offlineTime).toBe(0);
-      expect(response.body.data.earned.iron_ore).toBe(0);
+      expect(response.body.data.earned).toEqual({});
     });
   });
 });

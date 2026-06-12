@@ -1,4 +1,4 @@
-import { query, execute } from '../config/database';
+import { query, execute, withTransaction } from '../config/database';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
@@ -68,14 +68,16 @@ export async function createUser(input: CreateUserInput): Promise<Omit<User, 'pa
   const userId = uuidv4();
   const now = new Date();
 
-  await execute(
-    `INSERT INTO users (id, username, password_hash, created_at, last_login)
-     VALUES ($1, $2, $3, $4, NULL)`,
-    [userId, input.username.trim(), passwordHash, now]
-  );
+  await withTransaction(async client => {
+    await client.query(
+      `INSERT INTO users (id, username, password_hash, created_at, last_login)
+       VALUES ($1, $2, $3, $4, NULL)`,
+      [userId, input.username.trim(), passwordHash, now]
+    );
 
-  // 初始化玩家数据（创建玩家记录和棋子）
-  await initializePlayer(userId);
+    // 初始化玩家数据（创建玩家记录和棋子）
+    await initializePlayer(userId, client);
+  });
 
   return {
     id: userId,

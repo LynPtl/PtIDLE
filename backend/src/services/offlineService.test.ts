@@ -3,11 +3,61 @@ import {
   calculateOfflineEarnings,
   applyWarehouseLimits,
   calculateStoredAmount,
+  claimOfflineIdleRewards,
   MAX_OFFLINE_MINUTES,
   DEFAULT_WAREHOUSE_LIMIT,
 } from '../services/offlineService';
+import { withTransaction } from '../config/database';
+import { addInventoryItem } from './inventoryService';
+import { getGatheringConfig } from './skillService';
+
+jest.mock('../config/database', () => ({
+  withTransaction: jest.fn(),
+}));
+
+jest.mock('./inventoryService', () => ({
+  addInventoryItem: jest.fn(),
+}));
+
+jest.mock('./skillService', () => ({
+  getGatheringConfig: jest.fn(),
+}));
+
+const mockedWithTransaction = withTransaction as jest.MockedFunction<typeof withTransaction>;
+const mockedAddInventoryItem = addInventoryItem as jest.MockedFunction<typeof addInventoryItem>;
+const mockedGetGatheringConfig = getGatheringConfig as jest.MockedFunction<typeof getGatheringConfig>;
+
+const mockTransactionClient = {
+  query: jest.fn(),
+};
 
 describe('offlineService', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedWithTransaction.mockImplementation(async callback => callback(mockTransactionClient as any));
+    mockedAddInventoryItem.mockResolvedValue(undefined);
+    mockedGetGatheringConfig.mockResolvedValue({
+      mining: {
+        primaryResource: 'iron_ore',
+        baseRate: 1,
+        byproduct: 'coal',
+        byproductChance: 0,
+      },
+      woodcutting: {
+        primaryResource: 'wood',
+        baseRate: 1,
+        byproduct: 'sap',
+        byproductChance: 0,
+      },
+      herbalism: {
+        primaryResource: 'herb',
+        baseRate: 1,
+        byproduct: 'mushroom',
+        byproductChance: 0,
+      },
+    } as any);
+  });
+
   describe('calculateStoredAmount', () => {
     it('should store all added resources when there is capacity', () => {
       expect(calculateStoredAmount(100, 50, 1000)).toBe(50);
@@ -146,6 +196,82 @@ describe('offlineService', () => {
       const result = applyWarehouseLimits(earnings, currentResources, warehouseLimits);
 
       expect(result.stored.iron_ore).toBe(60);
+    });
+  });
+
+  describe('claimOfflineIdleRewards', () => {
+    it('should return null when player does not exist', async () => {
+      mockTransactionClient.query.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+      const result = await claimOfflineIdleRewards('missing-user', new Date('2026-06-12T00:10:00.000Z'));
+
+      expect(result).toBeNull();
+      expect(mockedWithTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not mint resources when there are no completed real idle tasks', async () => {
+      const now = new Date('2026-06-12T00:10:00.000Z');
+      mockTransactionClient.query
+        .mockResolvedValueOnce({ rows: [{ id: 'player-1', warehouse_limits: { resource: 1000 }, last_offline: new Date('2026-06-11T23:10:00.000Z') }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      const result = await claimOfflineIdleRewards('user-1', now);
+
+      expect(result).toEqual({
+        offlineTime: 60,
+        taskCount: 0,
+        earned: {},
+        stored: {},
+        overflowed: {},
+        lastOffline: new Date('2026-06-11T23:10:00.000Z'),
+      });
+      expect(mockedAddInventoryItem).not.toHaveBeenCalled();
+      expect(mockTransactionClient.query.mock.calls.map(call => String(call[0])).join('\n')).toContain('FROM idle_tasks');
+    });
+
+    it('should settle only due idle task rewards into inventory and mark task completed', async () => {
+      const now = new Date('2026-06-12T00:10:00.000Z');
+      const startedAt = new Date('2026-06-12T00:00:00.000Z');
+      const endsAt = new Date('2026-06-12T00:01:00.000Z');
+      mockTransactionClient.query
+        .mockResolvedValueOnce({ rows: [{ id: 'player-1', warehouse_limits: { resource: 1000 }, last_offline: new Date('2026-06-11T23:10:00.000Z') }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ id: 'task-1', skill_type: 'mining', started_at: startedAt, ends_at: endsAt }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ item_key: 'iron_ore', quantity: 10 }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      const result = await claimOfflineIdleRewards('user-1', now);
+
+      expect(result?.taskCount).toBe(1);
+      expect(result?.earned).toEqual({ iron_ore: 1 });
+      expect(result?.stored).toEqual({ iron_ore: 1 });
+      expect(result?.overflowed).toEqual({});
+      expect(mockedAddInventoryItem).toHaveBeenCalledWith('player-1', 'resource', 'iron_ore', 1, {}, mockTransactionClient);
+      expect(mockTransactionClient.query).toHaveBeenCalledWith(
+        expect.stringContaining("status = 'completed'"),
+        ['task-1', JSON.stringify({ resources: { iron_ore: 1 }, overflowed: {} })]
+      );
+      expect(mockedAddInventoryItem).not.toHaveBeenCalledWith(expect.any(String), 'resource', 'wood', expect.any(Number), expect.any(Object), expect.anything());
+      expect(mockedAddInventoryItem).not.toHaveBeenCalledWith(expect.any(String), 'resource', 'herb', expect.any(Number), expect.any(Object), expect.anything());
+    });
+
+    it('should overflow due task rewards when resource warehouse is full', async () => {
+      const now = new Date('2026-06-12T00:10:00.000Z');
+      mockTransactionClient.query
+        .mockResolvedValueOnce({ rows: [{ id: 'player-1', warehouse_limits: { resource: 10 }, last_offline: now }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ id: 'task-1', skill_type: 'mining', started_at: new Date('2026-06-12T00:00:00.000Z'), ends_at: new Date('2026-06-12T00:05:00.000Z') }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ item_key: 'iron_ore', quantity: 8 }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      const result = await claimOfflineIdleRewards('user-1', now);
+
+      expect(result?.earned).toEqual({ iron_ore: 5 });
+      expect(result?.stored).toEqual({ iron_ore: 2 });
+      expect(result?.overflowed).toEqual({ iron_ore: 3 });
+      expect(mockedAddInventoryItem).toHaveBeenCalledWith('player-1', 'resource', 'iron_ore', 2, {}, mockTransactionClient);
     });
   });
 
