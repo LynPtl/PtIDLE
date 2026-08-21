@@ -5,6 +5,9 @@
 **日期**：2026-03-10
 **状态**：概念设计
 
+**延伸设计文档**：
+- [挂机增量系统策划与数值设计](./superpowers/specs/2026-08-21-idle-incremental-system-design.md)
+
 ---
 
 ## 一、项目概述 (Project Overview)
