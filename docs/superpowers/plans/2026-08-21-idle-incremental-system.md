@@ -40,6 +40,7 @@ This plan covers one subsystem: the idle incremental backend. It deliberately st
 - Modify: `backend/src/services/inventoryService.ts`
   - Keep low-level inventory summary, add, consume, and quantity functions.
   - Add support for consuming multiple item types when crafting and processing need it.
+  - Extend `InventoryItemType`, `InventorySummary`, and `INVENTORY_ITEM_TYPES` with `storage`.
 - Create: `backend/src/services/capacityService.ts`
   - Own capacity summaries, storable amount calculation, partial store, and strict store preflight.
 - Modify: `backend/src/services/processingService.ts`
@@ -248,6 +249,7 @@ export const DEFAULT_WAREHOUSE_LIMITS: Record<InventoryItemType, number> = {
   certification: 10,
   card: 200,
   consumable: 100,
+  storage: 20,
 };
 
 export function calculateStorableAmount(currentUsed: number, incoming: number, limit: number): number {
@@ -318,10 +320,20 @@ export async function storeWithCapacity(
 
 - [ ] **Step 4: Extend inventory helper tests**
 
-Add `consumeInventoryCostMap` tests in `backend/src/services/inventoryService.test.ts`:
+Add `storage` bucket coverage and `consumeInventoryCostMap` tests in `backend/src/services/inventoryService.test.ts`:
 
 ```ts
 import { consumeInventoryCostMap } from '../services/inventoryService';
+
+it('includes storage in inventory summaries', async () => {
+  mockQuery.mockResolvedValueOnce([
+    { item_type: 'storage', item_key: 'basic_resource_storage', quantity: 1 },
+  ] as any);
+
+  const summary = await getInventorySummary('player-1');
+
+  expect(summary.storage).toEqual({ basic_resource_storage: 1 });
+});
 
 it('consumes mixed resource and material costs in one transaction', async () => {
   const client = createMockClient();
@@ -347,6 +359,15 @@ it('consumes mixed resource and material costs in one transaction', async () => 
 In `backend/src/services/inventoryService.ts`, rename no existing public functions. Add:
 
 ```ts
+export type InventoryItemType =
+  | 'resource'
+  | 'material'
+  | 'gear'
+  | 'certification'
+  | 'card'
+  | 'consumable'
+  | 'storage';
+
 export async function consumeInventoryByType(
   playerId: string,
   itemType: InventoryItemType,
